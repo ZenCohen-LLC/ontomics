@@ -730,11 +730,19 @@ mod integration {
             .iter()
             .map(|c| (c.id, c.clone()))
             .collect();
+        // Collected and resolved exactly as GraphBuilder::analyze does, so
+        // entity relationships here match what the pipeline produces.
+        let mut all_imports: Vec<types::ImportStatement> = parse_results
+            .iter()
+            .flat_map(|r| r.imports.iter().cloned())
+            .collect();
+        ontomics::resolve::resolve_imports(&mut all_imports, repo);
         let (built_entities, entity_rels) = entity::build_entities(
             &analysis.signatures,
             &analysis.classes,
             &analysis.call_sites,
             &concept_map,
+            &all_imports,
         );
 
         let mut embedding_index = if config.embeddings.enabled {
@@ -753,6 +761,7 @@ mod integration {
             embedding_index,
             built_entities,
             entity_rels,
+            all_imports,
         )
         .expect("graph build failed");
 
@@ -1138,6 +1147,7 @@ mod mcp_tools {
             classes: vec![],
             call_sites: vec![],
             nesting_trees: vec![],
+            doc_texts: vec![],
         };
         let embeddings = ontomics::embeddings::EmbeddingIndex::empty();
 
@@ -1176,6 +1186,7 @@ mod mcp_tools {
             embeddings,
             vec![entity_a, entity_b],
             rels,
+            vec![],
         )
         .expect("graph build failed");
 
