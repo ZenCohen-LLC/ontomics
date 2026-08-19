@@ -13,6 +13,7 @@ use candle_transformers::models::nomic_bert::{
 use hf_hub::api::sync::ApiBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
@@ -77,6 +78,88 @@ fn load_tokenizer(path: &PathBuf, max_length: usize, use_padding: bool) -> Resul
         }))
         .map_err(|e| anyhow!("failed to set truncation: {e}"))?;
     Ok(tokenizer)
+}
+
+/// Context length each long-context model was actually *trained* on.
+///
+/// `config.json` advertises an architectural maximum (`n_positions`) far above
+/// the trained window (`max_trained_positions`). Feeding a transformer more
+/// positions than it was trained for is both quadratically expensive and out
+/// of distribution, so truncation is capped at the trained window instead.
+const CODE_RANK_MAX_TOKENS: usize = 2048;
+const GTE_MODERN_MAX_TOKENS: usize = 2048;
+const JINA_CODE_MAX_TOKENS: usize = 2048;
+
+/// Largest batch each model will form, before the attention budget below
+/// shrinks it further for long inputs.
+const CODE_RANK_MAX_BATCH: usize = 8;
+const GTE_MODERN_MAX_BATCH: usize = 2;
+
+/// Upper bound on `batch_size * seq_len^2` for a single forward pass.
+///
+/// Self-attention materialises a `[batch, heads, seq, seq]` score tensor, so
+/// its cost scales with the square of the *longest* sequence in the batch —
+/// and because padding uses [`PaddingStrategy::BatchLongest`], one long input
+/// inflates every other row alongside it. A fixed batch of 8 whose longest
+/// member reached 7,410 tokens asked for `8 * 12 * 7410^2 * 4 B` = 21 GB in a
+/// single allocation and aborted the process.
+///
+/// Bounding the product keeps peak allocation flat regardless of how long any
+/// individual input is. At 12 heads in f32 this budget is roughly 400 MB per
+/// score tensor.
+const MAX_BATCH_SEQ_SQ: usize = 8_500_000;
+
+/// Group sequence lengths into contiguous batches respecting both `max_batch`
+/// and [`MAX_BATCH_SEQ_SQ`].
+///
+/// Input order is preserved, so callers can concatenate results directly. A
+/// sequence too long to share a batch is emitted alone rather than dropped —
+/// truncation, not omission, is what bounds its cost.
+fn plan_batches(lens: &[usize], max_batch: usize) -> Vec<Range<usize>> {
+    let max_batch = max_batch.max(1);
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut longest = 0usize;
+    for (i, &len) in lens.iter().enumerate() {
+        let widest = longest.max(len);
+        let count = i - start + 1;
+        let fits = count <= max_batch
+            && count.saturating_mul(widest.saturating_mul(widest))
+                <= MAX_BATCH_SEQ_SQ;
+        if fits {
+            longest = widest;
+        } else if i == start {
+            // One sequence over budget by itself; nothing to split off.
+            batches.push(start..i + 1);
+            start = i + 1;
+            longest = 0;
+        } else {
+            batches.push(start..i);
+            start = i;
+            longest = len;
+        }
+    }
+    if start < lens.len() {
+        batches.push(start..lens.len());
+    }
+    batches
+}
+
+/// Token length of each text under the tokenizer's configured truncation.
+///
+/// Costs one extra tokenizer pass, which is negligible beside a twelve-layer
+/// forward pass and is what lets batches be sized by real token counts rather
+/// than a guess.
+fn token_lengths(tokenizer: &Tokenizer, texts: &[String]) -> Result<Vec<usize>> {
+    texts
+        .iter()
+        .map(|text| {
+            tokenizer
+                .encode(text.as_str(), true)
+                .map(|encoding| encoding.get_ids().len())
+                .map_err(|e| anyhow!("tokenization failed: {e}"))
+        })
+        .collect()
 }
 
 fn encode_batch(
@@ -288,7 +371,8 @@ impl JinaCodeModel {
             serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
         // No padding — jina_bert Module::forward takes no attention mask,
         // so we embed one text at a time to avoid padding corruption.
-        let tokenizer = load_tokenizer(&tokenizer_path, 8192, false)?;
+        let tokenizer =
+            load_tokenizer(&tokenizer_path, JINA_CODE_MAX_TOKENS, false)?;
         let remapped = load_jina_code_remapped(&weights_path, &device)?;
         let vb = VarBuilder::from_tensors(remapped, DType::F32, &device);
         let model = JinaBertModel::new(vb, &config)?;
@@ -357,7 +441,8 @@ impl CodeRankModel {
             fetch_model_files(CODE_RANK_ID, cache_dir)?;
         let config: NomicConfig =
             serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
-        let tokenizer = load_tokenizer(&tokenizer_path, 8192, true)?;
+        let tokenizer =
+            load_tokenizer(&tokenizer_path, CODE_RANK_MAX_TOKENS, true)?;
         let weights = std::fs::read(&weights_path)?;
         let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
         let model = NomicBertModel::load(vb, &config)?;
@@ -374,8 +459,10 @@ impl EmbeddingModel for CodeRankModel {
         if texts.is_empty() {
             return Ok(vec![]);
         }
+        let lens = token_lengths(&self.tokenizer, &texts)?;
         let mut all_results = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(8) {
+        for range in plan_batches(&lens, CODE_RANK_MAX_BATCH) {
+            let chunk = &texts[range];
             let (token_ids, type_ids, mask, batch_size, _) =
                 encode_batch(&self.tokenizer, chunk, &self.device)?;
             let output = self.model.forward(
@@ -416,7 +503,8 @@ impl GteModernBertModel {
             fetch_model_files(GTE_MODERN_ID, cache_dir)?;
         let config: ModernConfig =
             serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
-        let tokenizer = load_tokenizer(&tokenizer_path, 8192, true)?;
+        let tokenizer =
+            load_tokenizer(&tokenizer_path, GTE_MODERN_MAX_TOKENS, true)?;
         let remapped = load_gte_modern_remapped(&weights_path, &device)?;
         let vb = VarBuilder::from_tensors(remapped, DType::F32, &device);
         let model = ModernBert::load(vb, &config)?;
@@ -433,8 +521,10 @@ impl EmbeddingModel for GteModernBertModel {
         if texts.is_empty() {
             return Ok(vec![]);
         }
+        let lens = token_lengths(&self.tokenizer, &texts)?;
         let mut all_results = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(2) {
+        for range in plan_batches(&lens, GTE_MODERN_MAX_BATCH) {
+            let chunk = &texts[range];
             let (token_ids, _, mask, batch_size, _) =
                 encode_batch(&self.tokenizer, chunk, &self.device)?;
             let output = self.model.forward(&token_ids, &mask)?;
@@ -894,5 +984,102 @@ mod tests {
         assert!(SUPPORTED_MODELS.contains(&JINA_CODE_ID));
         assert!(SUPPORTED_MODELS.contains(&CODE_RANK_ID));
         assert!(SUPPORTED_MODELS.contains(&GTE_MODERN_ID));
+    }
+
+    /// Peak attention allocation for a batch, in bytes, at 12 heads in f32.
+    fn attention_bytes(count: usize, widest: usize) -> usize {
+        count * 12 * widest * widest * 4
+    }
+
+    #[test]
+    fn test_plan_batches_fills_to_max_batch_when_short() {
+        let lens = vec![64; 20];
+        let batches = plan_batches(&lens, CODE_RANK_MAX_BATCH);
+        assert_eq!(batches, vec![0..8, 8..16, 16..20]);
+    }
+
+    #[test]
+    fn test_plan_batches_preserves_order_and_covers_every_input() {
+        let lens = vec![1500, 40, 40, 2048, 40, 900, 900, 40];
+        let batches = plan_batches(&lens, CODE_RANK_MAX_BATCH);
+        let mut covered = Vec::new();
+        for range in &batches {
+            assert!(!range.is_empty(), "empty batch: {range:?}");
+            covered.extend(range.clone());
+        }
+        assert_eq!(covered, (0..lens.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_plan_batches_isolates_long_sequences() {
+        // A long body must not drag seven short ones up to its padded width.
+        let mut lens = vec![32; 7];
+        lens.push(2048);
+        let batches = plan_batches(&lens, CODE_RANK_MAX_BATCH);
+        assert_eq!(batches, vec![0..7, 7..8]);
+    }
+
+    #[test]
+    fn test_plan_batches_respects_attention_budget() {
+        // Lengths spanning the full truncation range, worst-case ordering.
+        let lens = vec![2048, 2048, 1024, 512, 2048, 64, 64, 1024, 2048];
+        for range in plan_batches(&lens, CODE_RANK_MAX_BATCH) {
+            let count = range.len();
+            let widest = lens[range.clone()].iter().copied().max().unwrap_or(0);
+            assert!(
+                count * widest * widest <= MAX_BATCH_SEQ_SQ,
+                "batch {range:?} exceeds budget: {count} x {widest}^2",
+            );
+            assert!(
+                attention_bytes(count, widest) < 512 * 1024 * 1024,
+                "batch {range:?} would allocate {} MB",
+                attention_bytes(count, widest) / (1024 * 1024),
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_batches_bounds_the_reported_regression() {
+        // The failure was a batch of 8 padded to 7,410 tokens asking for 21 GB.
+        // Truncation caps width; batching caps how many share that width.
+        let lens = vec![CODE_RANK_MAX_TOKENS; 8];
+        let batches = plan_batches(&lens, CODE_RANK_MAX_BATCH);
+        assert!(batches.len() > 1, "long sequences must not share one batch");
+        let worst = batches
+            .iter()
+            .map(|r| attention_bytes(r.len(), CODE_RANK_MAX_TOKENS))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst < 1024 * 1024 * 1024,
+            "worst batch still allocates {} MB",
+            worst / (1024 * 1024),
+        );
+    }
+
+    #[test]
+    fn test_plan_batches_emits_oversized_sequence_alone() {
+        // Defence in depth: even above the budget nothing is dropped.
+        let lens = vec![64, 100_000, 64];
+        let batches = plan_batches(&lens, CODE_RANK_MAX_BATCH);
+        assert_eq!(batches, vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn test_plan_batches_handles_empty_and_degenerate_input() {
+        assert!(plan_batches(&[], CODE_RANK_MAX_BATCH).is_empty());
+        assert_eq!(plan_batches(&[10], 0), vec![0..1]);
+    }
+
+    #[test]
+    fn test_trained_context_caps_stay_within_budget_alone() {
+        for max_tokens in
+            [CODE_RANK_MAX_TOKENS, GTE_MODERN_MAX_TOKENS, JINA_CODE_MAX_TOKENS]
+        {
+            assert!(
+                max_tokens * max_tokens <= MAX_BATCH_SEQ_SQ,
+                "a single {max_tokens}-token sequence exceeds the budget",
+            );
+        }
     }
 }

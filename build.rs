@@ -13,6 +13,9 @@ const INDEX_FILES: &[&str] = &[
     "src/logic.rs",
     "src/centrality.rs",
     "src/pipeline.rs",
+    // Truncation limits and batching decided here change the vectors that get
+    // cached, so a change must invalidate previously stored embeddings.
+    "src/embeddings.rs",
 ];
 
 fn main() {
