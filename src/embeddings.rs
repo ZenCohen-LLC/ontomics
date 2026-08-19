@@ -150,11 +150,20 @@ fn plan_batches(lens: &[usize], max_batch: usize) -> Vec<Range<usize>> {
 /// Resolve the batch ceiling for a model.
 ///
 /// `configured` is `resources.embedding_batch_size` when the caller supplied
-/// it. It acts as a ceiling only: [`plan_batches`] may lower it for long
-/// inputs, and nothing raises it. `None` falls back to the model's own
-/// default.
+/// it. It can only ever *lower* the batch size: the result is clamped to the
+/// model's own default, and [`plan_batches`] may lower it further for long
+/// inputs. Nothing here can make a batch larger than it would be without any
+/// configuration at all.
+///
+/// That one-way behaviour is deliberate. The setting is documented in
+/// `config.rs` as "Smaller = less peak memory", so treating a large value as
+/// licence to widen batches would work against its stated purpose — and would
+/// silently change tuned per-model defaults for anyone who never touched it.
 fn batch_ceiling(configured: Option<usize>, model_default: usize) -> usize {
-    configured.unwrap_or(model_default).max(1)
+    configured
+        .unwrap_or(model_default)
+        .min(model_default)
+        .max(1)
 }
 
 /// Token length of each text under the tokenizer's configured truncation.
@@ -1152,9 +1161,24 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_ceiling_prefers_configured_value() {
-        assert_eq!(batch_ceiling(Some(64), CODE_RANK_MAX_BATCH), 64);
+    fn test_batch_ceiling_applies_a_smaller_configured_value() {
         assert_eq!(batch_ceiling(Some(2), CODE_RANK_MAX_BATCH), 2);
+        assert_eq!(batch_ceiling(Some(1), BGE_SMALL_MAX_BATCH), 1);
+    }
+
+    #[test]
+    fn test_batch_ceiling_never_exceeds_the_model_default() {
+        // A generous setting must not widen batches beyond the tuned default —
+        // the knob reduces work, it never adds it.
+        for model_default in
+            [BGE_SMALL_MAX_BATCH, CODE_RANK_MAX_BATCH, GTE_MODERN_MAX_BATCH]
+        {
+            assert_eq!(batch_ceiling(Some(4096), model_default), model_default);
+            assert_eq!(
+                batch_ceiling(Some(model_default + 1), model_default),
+                model_default,
+            );
+        }
     }
 
     #[test]
