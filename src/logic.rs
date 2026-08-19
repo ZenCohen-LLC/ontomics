@@ -13,23 +13,56 @@ pub struct LogicIndex {
     vectors: HashMap<u64, Vec<f32>>,
     cache_dir: Option<PathBuf>,
     model_id: String,
+    max_batch: Option<usize>,
 }
 
 impl LogicIndex {
     /// Initialize logic index with a specific model.
     pub fn new_with_model(model_id: &str, cache_dir: Option<PathBuf>) -> Result<Self> {
-        let model = embeddings::load_model(model_id, cache_dir.as_ref())?;
+        Self::new_with_model_and_batch(model_id, cache_dir, None)
+    }
+
+    /// Initialize with a specific model and an explicit batch ceiling from
+    /// `resources.embedding_batch_size`.
+    ///
+    /// The whole embedding plan is handed to [`LogicIndex::embed_batch`] in one
+    /// call, so this ceiling — together with the attention budget that may
+    /// lower it — is the only thing bounding how many function bodies share a
+    /// forward pass.
+    pub fn new_with_model_and_batch(
+        model_id: &str,
+        cache_dir: Option<PathBuf>,
+        max_batch: Option<usize>,
+    ) -> Result<Self> {
+        let model = embeddings::load_model_with_batch(
+            model_id,
+            cache_dir.as_ref(),
+            max_batch,
+        )?;
         Ok(Self {
             model: Some(model),
             vectors: HashMap::new(),
             cache_dir,
             model_id: model_id.to_string(),
+            max_batch,
         })
     }
 
     /// Initialize logic index with the default CodeRankEmbed model.
     pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
         Self::new_with_model(embeddings::CODE_RANK_ID, cache_dir)
+    }
+
+    /// Initialize with the default model and an explicit batch ceiling.
+    pub fn new_with_batch(
+        cache_dir: Option<PathBuf>,
+        max_batch: Option<usize>,
+    ) -> Result<Self> {
+        Self::new_with_model_and_batch(
+            embeddings::CODE_RANK_ID,
+            cache_dir,
+            max_batch,
+        )
     }
 
     /// Create an empty logic index (no model, empty vectors).
@@ -134,9 +167,20 @@ impl LogicIndex {
         } else {
             &self.model_id
         };
-        let model = embeddings::load_model(id, self.cache_dir.as_ref())?;
+        let model = embeddings::load_model_with_batch(
+            id,
+            self.cache_dir.as_ref(),
+            self.max_batch,
+        )?;
         self.model = Some(model);
         Ok(())
+    }
+
+    /// Set the batch ceiling used by a subsequent [`LogicIndex::load_model`].
+    /// Indexes restored from cache carry no model, so the ceiling has to be
+    /// re-supplied before the model loads.
+    pub fn set_max_batch(&mut self, max_batch: Option<usize>) {
+        self.max_batch = max_batch;
     }
 
     /// Set cache directory for model weights.
@@ -171,6 +215,9 @@ impl<'de> Deserialize<'de> for LogicIndex {
             vectors,
             cache_dir: None,
             model_id: String::new(),
+            // Not persisted: a restored index has no model yet. Callers pass
+            // the ceiling via `set_max_batch` before `load_model`.
+            max_batch: None,
         })
     }
 }

@@ -289,7 +289,10 @@ fn enrich_graph_with_embeddings_inner(
     eprintln!("Background: loading embedding model...");
     let logic_cache_dir = work.model_cache_dir.clone();
     let mut embedding_index =
-        embeddings::EmbeddingIndex::new(work.model_cache_dir)?;
+        embeddings::EmbeddingIndex::new_with_batch(
+            work.model_cache_dir,
+            Some(work.batch_size),
+        )?;
 
     // Determine which concepts still need embedding
     let embedded_ids = graph_handle
@@ -415,7 +418,10 @@ fn enrich_graph_with_embeddings_inner(
 
         if !plan.is_empty() {
             eprintln!("Background: embedding {} logic vectors...", plan.len());
-            match ontomics::logic::LogicIndex::new(logic_cache_dir) {
+            match ontomics::logic::LogicIndex::new_with_batch(
+                logic_cache_dir,
+                Some(work.batch_size),
+            ) {
                 Ok(mut logic_idx) => {
                     if let Err(e) = logic_idx.embed_batch(plan) {
                         eprintln!("Background: logic embedding failed: {e}");

@@ -90,8 +90,10 @@ const CODE_RANK_MAX_TOKENS: usize = 2048;
 const GTE_MODERN_MAX_TOKENS: usize = 2048;
 const JINA_CODE_MAX_TOKENS: usize = 2048;
 
-/// Largest batch each model will form, before the attention budget below
-/// shrinks it further for long inputs.
+/// Default ceiling on batch size per model, used when the caller supplies no
+/// `resources.embedding_batch_size`. The attention budget below may shrink a
+/// batch further; nothing ever raises it above this.
+const BGE_SMALL_MAX_BATCH: usize = 32;
 const CODE_RANK_MAX_BATCH: usize = 8;
 const GTE_MODERN_MAX_BATCH: usize = 2;
 
@@ -143,6 +145,16 @@ fn plan_batches(lens: &[usize], max_batch: usize) -> Vec<Range<usize>> {
         batches.push(start..lens.len());
     }
     batches
+}
+
+/// Resolve the batch ceiling for a model.
+///
+/// `configured` is `resources.embedding_batch_size` when the caller supplied
+/// it. It acts as a ceiling only: [`plan_batches`] may lower it for long
+/// inputs, and nothing raises it. `None` falls back to the model's own
+/// default.
+fn batch_ceiling(configured: Option<usize>, model_default: usize) -> usize {
+    configured.unwrap_or(model_default).max(1)
 }
 
 /// Token length of each text under the tokenizer's configured truncation.
@@ -306,10 +318,14 @@ pub const BGE_SMALL_ID: &str = "BAAI/bge-small-en-v1.5";
 pub(crate) struct BgeSmallModel {
     model: BertModel,
     tokenizer: Tokenizer,
+    max_batch: usize,
 }
 
 impl BgeSmallModel {
-    pub(crate) fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+    pub(crate) fn load(
+        cache_dir: Option<&PathBuf>,
+        max_batch: Option<usize>,
+    ) -> Result<Self> {
         let device = detect_device()?;
         let (config_path, tokenizer_path, weights_path) =
             fetch_model_files(BGE_SMALL_ID, cache_dir)?;
@@ -319,7 +335,11 @@ impl BgeSmallModel {
         let weights = std::fs::read(&weights_path)?;
         let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
         let model = BertModel::load(vb, &config)?;
-        Ok(Self { model, tokenizer })
+        Ok(Self {
+            model,
+            tokenizer,
+            max_batch: batch_ceiling(max_batch, BGE_SMALL_MAX_BATCH),
+        })
     }
 }
 
@@ -329,8 +349,10 @@ impl EmbeddingModel for BgeSmallModel {
             return Ok(vec![]);
         }
         let device = &self.model.device;
+        let lens = token_lengths(&self.tokenizer, &texts)?;
         let mut all_results = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(32) {
+        for range in plan_batches(&lens, self.max_batch) {
+            let chunk = &texts[range];
             let (token_ids, type_ids, mask, batch_size, _) =
                 encode_batch(&self.tokenizer, chunk, device)?;
             let output = self.model.forward(
@@ -432,10 +454,14 @@ pub(crate) struct CodeRankModel {
     model: NomicBertModel,
     tokenizer: Tokenizer,
     device: Device,
+    max_batch: usize,
 }
 
 impl CodeRankModel {
-    pub(crate) fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+    pub(crate) fn load(
+        cache_dir: Option<&PathBuf>,
+        max_batch: Option<usize>,
+    ) -> Result<Self> {
         let device = detect_device()?;
         let (config_path, tokenizer_path, weights_path) =
             fetch_model_files(CODE_RANK_ID, cache_dir)?;
@@ -450,6 +476,7 @@ impl CodeRankModel {
             model,
             tokenizer,
             device,
+            max_batch: batch_ceiling(max_batch, CODE_RANK_MAX_BATCH),
         })
     }
 }
@@ -461,7 +488,7 @@ impl EmbeddingModel for CodeRankModel {
         }
         let lens = token_lengths(&self.tokenizer, &texts)?;
         let mut all_results = Vec::with_capacity(texts.len());
-        for range in plan_batches(&lens, CODE_RANK_MAX_BATCH) {
+        for range in plan_batches(&lens, self.max_batch) {
             let chunk = &texts[range];
             let (token_ids, type_ids, mask, batch_size, _) =
                 encode_batch(&self.tokenizer, chunk, &self.device)?;
@@ -494,10 +521,14 @@ pub(crate) struct GteModernBertModel {
     model: ModernBert,
     tokenizer: Tokenizer,
     device: Device,
+    max_batch: usize,
 }
 
 impl GteModernBertModel {
-    pub(crate) fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+    pub(crate) fn load(
+        cache_dir: Option<&PathBuf>,
+        max_batch: Option<usize>,
+    ) -> Result<Self> {
         let device = detect_device()?;
         let (config_path, tokenizer_path, weights_path) =
             fetch_model_files(GTE_MODERN_ID, cache_dir)?;
@@ -512,6 +543,7 @@ impl GteModernBertModel {
             model,
             tokenizer,
             device,
+            max_batch: batch_ceiling(max_batch, GTE_MODERN_MAX_BATCH),
         })
     }
 }
@@ -523,7 +555,7 @@ impl EmbeddingModel for GteModernBertModel {
         }
         let lens = token_lengths(&self.tokenizer, &texts)?;
         let mut all_results = Vec::with_capacity(texts.len());
-        for range in plan_batches(&lens, GTE_MODERN_MAX_BATCH) {
+        for range in plan_batches(&lens, self.max_batch) {
             let chunk = &texts[range];
             let (token_ids, _, mask, batch_size, _) =
                 encode_batch(&self.tokenizer, chunk, &self.device)?;
@@ -552,11 +584,27 @@ pub fn load_model(
     model_id: &str,
     cache_dir: Option<&PathBuf>,
 ) -> Result<Box<dyn EmbeddingModel>> {
+    load_model_with_batch(model_id, cache_dir, None)
+}
+
+/// Load a model with an explicit batch ceiling.
+///
+/// `max_batch` comes from `resources.embedding_batch_size`. It bounds how many
+/// texts may share one forward pass; the attention budget can lower that
+/// further for long inputs but never raises it. `None` uses each model's own
+/// default.
+pub fn load_model_with_batch(
+    model_id: &str,
+    cache_dir: Option<&PathBuf>,
+    max_batch: Option<usize>,
+) -> Result<Box<dyn EmbeddingModel>> {
     match model_id {
-        BGE_SMALL_ID => Ok(Box::new(BgeSmallModel::load(cache_dir)?)),
+        BGE_SMALL_ID => Ok(Box::new(BgeSmallModel::load(cache_dir, max_batch)?)),
         JINA_CODE_ID => Ok(Box::new(JinaCodeModel::load(cache_dir)?)),
-        CODE_RANK_ID => Ok(Box::new(CodeRankModel::load(cache_dir)?)),
-        GTE_MODERN_ID => Ok(Box::new(GteModernBertModel::load(cache_dir)?)),
+        CODE_RANK_ID => Ok(Box::new(CodeRankModel::load(cache_dir, max_batch)?)),
+        GTE_MODERN_ID => {
+            Ok(Box::new(GteModernBertModel::load(cache_dir, max_batch)?))
+        }
         other => Err(anyhow!(
             "unknown embedding model: {other}. Supported: {BGE_SMALL_ID}, \
              {JINA_CODE_ID}, {CODE_RANK_ID}, {GTE_MODERN_ID}"
@@ -582,23 +630,44 @@ pub struct EmbeddingIndex {
     vectors: HashMap<u64, Vec<f32>>,
     cache_dir: Option<PathBuf>,
     model_id: String,
+    max_batch: Option<usize>,
 }
 
 impl EmbeddingIndex {
     /// Initialize embedding index with a specific model.
     pub fn new_with_model(model_id: &str, cache_dir: Option<PathBuf>) -> Result<Self> {
-        let model = load_model(model_id, cache_dir.as_ref())?;
+        Self::new_with_model_and_batch(model_id, cache_dir, None)
+    }
+
+    /// Initialize with a specific model and an explicit batch ceiling from
+    /// `resources.embedding_batch_size`. The ceiling is remembered so a later
+    /// [`EmbeddingIndex::load_model`] on a cache-deserialized index reuses it.
+    pub fn new_with_model_and_batch(
+        model_id: &str,
+        cache_dir: Option<PathBuf>,
+        max_batch: Option<usize>,
+    ) -> Result<Self> {
+        let model = load_model_with_batch(model_id, cache_dir.as_ref(), max_batch)?;
         Ok(Self {
             model: Some(model),
             vectors: HashMap::new(),
             cache_dir,
             model_id: model_id.to_string(),
+            max_batch,
         })
     }
 
     /// Initialize embedding index with the default BGE-small model.
     pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
         Self::new_with_model(BGE_SMALL_ID, cache_dir)
+    }
+
+    /// Initialize with the default model and an explicit batch ceiling.
+    pub fn new_with_batch(
+        cache_dir: Option<PathBuf>,
+        max_batch: Option<usize>,
+    ) -> Result<Self> {
+        Self::new_with_model_and_batch(BGE_SMALL_ID, cache_dir, max_batch)
     }
 
     /// Create an empty embedding index (no model, for when embeddings are disabled).
@@ -620,9 +689,17 @@ impl EmbeddingIndex {
         } else {
             &self.model_id
         };
-        let model = load_model(id, self.cache_dir.as_ref())?;
+        let model =
+            load_model_with_batch(id, self.cache_dir.as_ref(), self.max_batch)?;
         self.model = Some(model);
         Ok(())
+    }
+
+    /// Set the batch ceiling used by a subsequent
+    /// [`EmbeddingIndex::load_model`]. Indexes restored from cache carry no
+    /// model, so the ceiling has to be re-supplied before the model loads.
+    pub fn set_max_batch(&mut self, max_batch: Option<usize>) {
+        self.max_batch = max_batch;
     }
 
     /// Build the text representation for a concept embedding.
@@ -776,6 +853,9 @@ impl<'de> Deserialize<'de> for EmbeddingIndex {
             vectors,
             cache_dir: None,
             model_id: String::new(),
+            // Not persisted: a restored index has no model yet. Callers pass
+            // the ceiling via `set_max_batch` before `load_model`.
+            max_batch: None,
         })
     }
 }
@@ -1069,6 +1149,53 @@ mod tests {
     fn test_plan_batches_handles_empty_and_degenerate_input() {
         assert!(plan_batches(&[], CODE_RANK_MAX_BATCH).is_empty());
         assert_eq!(plan_batches(&[10], 0), vec![0..1]);
+    }
+
+    #[test]
+    fn test_batch_ceiling_prefers_configured_value() {
+        assert_eq!(batch_ceiling(Some(64), CODE_RANK_MAX_BATCH), 64);
+        assert_eq!(batch_ceiling(Some(2), CODE_RANK_MAX_BATCH), 2);
+    }
+
+    #[test]
+    fn test_batch_ceiling_falls_back_to_model_default() {
+        assert_eq!(batch_ceiling(None, CODE_RANK_MAX_BATCH), CODE_RANK_MAX_BATCH);
+        assert_eq!(batch_ceiling(None, BGE_SMALL_MAX_BATCH), BGE_SMALL_MAX_BATCH);
+    }
+
+    #[test]
+    fn test_batch_ceiling_never_returns_zero() {
+        // config.rs clamps 0 to 1, but the model must not divide by zero even
+        // if it is constructed directly.
+        assert_eq!(batch_ceiling(Some(0), CODE_RANK_MAX_BATCH), 1);
+        assert_eq!(batch_ceiling(None, 0), 1);
+    }
+
+    #[test]
+    fn test_budget_lowers_a_generous_configured_ceiling() {
+        // A caller asking for 64 still gets small batches when inputs are long:
+        // the ceiling may only lower the batch, never raise memory use.
+        let lens = vec![2048; 16];
+        for range in plan_batches(&lens, 64) {
+            assert!(
+                range.len() * 2048 * 2048 <= MAX_BATCH_SEQ_SQ,
+                "budget ignored for batch {range:?}",
+            );
+            assert!(
+                attention_bytes(range.len(), 2048) < 512 * 1024 * 1024,
+                "batch {range:?} allocates {} MB",
+                attention_bytes(range.len(), 2048) / (1024 * 1024),
+            );
+        }
+    }
+
+    #[test]
+    fn test_configured_ceiling_binds_when_below_budget() {
+        // Short inputs would fit far more per batch, but the ceiling wins.
+        let lens = vec![16; 40];
+        for range in plan_batches(&lens, 4) {
+            assert!(range.len() <= 4, "ceiling exceeded by {range:?}");
+        }
     }
 
     #[test]
