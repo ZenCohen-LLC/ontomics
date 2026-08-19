@@ -175,6 +175,9 @@ impl<'a> GraphBuilder<'a> {
                     return Ok(self);
                 }
 
+                cached.embeddings.set_max_batch(Some(
+                    self.config.resources.embedding_batch_size,
+                ));
                 if let Err(e) = cached.embeddings.load_model() {
                     let msg = format!(
                         "Embedding model unavailable: {e}. \
@@ -519,8 +522,9 @@ impl<'a> GraphBuilder<'a> {
     ) -> Result<&mut Self> {
         let logic_cache_dir = self.model_cache_dir.clone();
         let mut embedding_index = if self.config.embeddings.enabled {
-            match embeddings::EmbeddingIndex::new(
+            match embeddings::EmbeddingIndex::new_with_batch(
                 self.model_cache_dir.take(),
+                Some(self.config.resources.embedding_batch_size),
             ) {
                 Ok(idx) => {
                     eprintln!("Loaded embedding model");
@@ -620,7 +624,10 @@ impl<'a> GraphBuilder<'a> {
         if self.config.logic.enabled
             && self.config.embeddings.enabled
         {
-            match crate::logic::LogicIndex::new(logic_cache_dir) {
+            match crate::logic::LogicIndex::new_with_batch(
+                logic_cache_dir,
+                Some(self.config.resources.embedding_batch_size),
+            ) {
                 Ok(mut logic_idx) => {
                     let items: Vec<(u64, String)> = g.signatures
                         .iter()
