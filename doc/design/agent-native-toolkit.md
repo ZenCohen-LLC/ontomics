@@ -235,6 +235,7 @@ never whole-run failure).
 | Phase | Work | Size |
 |---|---|---|
 | 0 | Hygiene: `.mjs/.cjs` include globs; delete dead `lsp.rs`; tree-sitter 0.26 bump | ~3 lines + −188 |
+| 0.5 | **Surface honesty** (§10.1): not-found reporting on unresolved filters; wire or delete the dead knobs; `vocabulary_health` honors `config.health`; announce truncation caps; resync the pi adapter | ~120 |
 | 1 | Table-driven language registry (kills per-language match arms; comby-style spec table) | ~160 |
 | 2 | File-tree ontology emission + corrections overlay (the CRUD surface, §4.2) | ~400 |
 | 3 | Query driver + Go at Tier 1 (validates languages-as-data) | ~650 |
@@ -244,14 +245,54 @@ never whole-run failure).
 Each phase is independently shippable and independently reversible; 3–5 are
 gated on measurement (testbed + `benchmark-embeddings`), not assumption.
 
-## 10. Open questions (pending review findings)
+## 10. Agent-native review outcomes (2026-08-22)
 
-- Which parity gaps did the capability map surface between CLI subcommands
-  and MCP tools, and which are worth closing vs. documenting?
-- Does the current MCP tool surface violate granularity (bundled judgment)
-  anywhere that the primitives plan (§3) doesn't already address?
-- Where should the corrections overlay live in the merge order relative to
-  imported domain packs (corrections-last is the current assumption)?
+Full review run against this repo: 19 findings across all 12 principles —
+**0 critical, 5 major, 10 minor, 4 nit**. Findings in the review workspace
+(`agent-native/findings/ontomics/2026-08-22/`). Assessment: agent-first
+rather than app-then-agent; the named architectural anti-patterns are
+essentially absent. Weaknesses cluster in two themes.
+
+### 10.1 Theme A — surface honesty (highest leverage)
+
+Each is cheap; collectively they let agents form confident wrong beliefs,
+which is the worst failure mode for a tool whose output feeds reasoning.
+All five verified against source:
+
+| Finding | Evidence |
+|---|---|
+| `list_entities` silently ignores an unresolvable `concept` filter — `concept_filter.and_then(...)` yields `None`, and `if let Some(cid)` then skips filtering, returning unfiltered top-k *as if filtered* | `src/graph/query.rs:444-455` |
+| `index.include` / `index.exclude` are parsed and documented but never consumed — all three `ParseOptions` sites use `lang.default_include()/default_exclude()` | fields `src/config.rs:291-292`; sites `src/main.rs:927-928`, `src/main.rs:1324-1325`, `src/pipeline.rs:223-224` |
+| `embeddings.model` is a live config field with no consumer (only `model_cache_dir` is read; BGE-small is hardcoded) | field `src/config.rs:312` |
+| `vocabulary_health` diverges by surface: MCP uses `HealthConfig::default()`, CLI uses `config.health` — same repo, different scores | `src/tools.rs:407` vs `src/main.rs:881` |
+| pi adapter exposes 12 of 20 registered tools — missing the entire L4 behavioral layer (`describe_logic`, `find_similar_logic`) plus `concept_map`, `describe_file`, `type_flows`, `trace_type`, `compact_context`, `generate_ontology_md` | `pi/extensions/index.ts` (12 `mcpName` entries) vs `src/tools.rs` `build_registry()` (20 `r.register`) |
+
+This theme validates §4.1's determinism argument from the opposite
+direction: a config knob that parses but does nothing is the config-file
+equivalent of nonce code — it looks verifiable and isn't.
+
+### 10.2 Theme B — the live-state boundary
+
+`Config::load` is called exactly once in production (`src/main.rs:511`); the
+watcher clones that config and never reloads it; and none of the 20
+registered tools is a `reindex`/`reload`/`refresh`/`invalidate`. So the
+file-based improvement loop this design leans on (§3, "improvement over
+time") currently activates only across a restart an agent cannot perform.
+
+**This directly implicates the §4.2 corrections overlay.** An overlay that
+only takes effect on restart is not an agent-usable CRUD surface. Phase 2
+must therefore ship a `reindex` tool alongside the overlay — they are one
+unit of work, not two. Related: results carry no freshness/generation
+provenance, and the computed `logic_concept_overlaps` are never exposed.
+
+### 10.3 Still open
+
+- Corrections-vs-packs merge order (corrections-last remains the working
+  assumption; nothing in the review bears on it).
 - Testbed policy for new languages: unit-parity only (as TS/JS/Rust today)
-  or full testbed expectations (as Python)? Owner decision required —
-  testbed expectations are the definition of done.
+  or full testbed expectations (as Python)? **Owner decision required** —
+  testbed expectations are the definition of done, and `tests/testbed.rs`
+  is a test file, so touching it needs explicit permission.
+- Two candidate principles were raised against the framework itself (tool-
+  result honesty, config honesty) and appended to the agent-native repo's
+  `candidate-principles.md` — both generalize beyond this codebase.
